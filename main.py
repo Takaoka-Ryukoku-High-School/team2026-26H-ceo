@@ -1,6 +1,9 @@
+import hmac
 import os
 import uuid
+from html.parser import HTMLParser
 from typing import Any
+from urllib.parse import quote, urlparse
 
 import msal
 import requests
@@ -112,6 +115,175 @@ def get_graph_access_token() -> str:
     return result["access_token"]
 
 
+def graph_is_configured() -> bool:
+    return all(get_m365_config().values())
+
+
+def graph_get_collection(
+    path: str,
+    access_token: str,
+    params: dict[str, str] | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    url = path if path.startswith("https://") else f"{GRAPH_BASE_URL}{path}"
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+    headers.update(extra_headers or {})
+    items: list[dict[str, Any]] = []
+
+    while url:
+        parsed_url = urlparse(url)
+        if parsed_url.scheme != "https" or parsed_url.netloc != "graph.microsoft.com":
+            raise RuntimeError("Microsoft Graph から不正なページ URL が返されました。")
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+        except requests.RequestException as error:
+            raise RuntimeError("Microsoft Graph に接続できませんでした。") from error
+        if not response.ok:
+            raise RuntimeError(f"Microsoft Graph API が HTTP {response.status_code} を返しました。")
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise RuntimeError("Microsoft Graph から不正な JSON が返されました。") from error
+        items.extend(payload.get("value", []))
+        url = payload.get("@odata.nextLink", "")
+        params = None
+
+    return items
+
+
+def get_graph_teams(access_token: str) -> list[dict[str, Any]]:
+    groups = graph_get_collection(
+        "/groups",
+        access_token,
+        params={
+            "$filter": "resourceProvisioningOptions/Any(x:x eq 'Team')",
+            "$select": "id,displayName,description",
+            "$count": "true",
+        },
+        extra_headers={"ConsistencyLevel": "eventual"},
+    )
+    teams = []
+    for group in groups:
+        team_id = str(group.get("id", ""))
+        if not team_id:
+            continue
+        channels = graph_get_collection(
+            f"/teams/{quote(team_id, safe='')}/channels", access_token
+        )
+        teams.append(
+            {
+                "id": team_id,
+                "name": group.get("displayName") or "名称未設定のチーム",
+                "description": group.get("description") or "",
+                "channels": [
+                    {"id": channel.get("id", ""), "name": channel.get("displayName") or "名称未設定"}
+                    for channel in channels
+                    if channel.get("id")
+                ],
+            }
+        )
+    return teams
+
+
+class _MessageBodyParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def _append_line_break(self) -> None:
+        if not self.parts or not self.parts[-1].endswith("\n"):
+            self.parts.append("\n")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"br", "div", "li", "p"}:
+            self._append_line_break()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"div", "li", "p"}:
+            self._append_line_break()
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def map_graph_message(
+    message: dict[str, Any], team: dict[str, Any], channel: dict[str, Any]
+) -> dict[str, str]:
+    body = message.get("body") or {}
+    parser = _MessageBodyParser()
+    parser.feed(str(body.get("content") or ""))
+    sender = message.get("from") or {}
+    author = sender.get("user", {}).get("displayName") or sender.get("application", {}).get(
+        "displayName"
+    ) or "Teams"
+    return {
+        "id": str(message.get("id", "")),
+        "author": author,
+        "content": "".join(parser.parts).strip(),
+        "timestamp": message.get("createdDateTime") or message.get("lastModifiedDateTime") or "",
+        "teamId": str(team["id"]),
+        "teamName": str(team["name"]),
+        "channelId": str(channel["id"]),
+        "channelName": str(channel["name"]),
+    }
+
+
+def get_graph_snapshot() -> dict[str, Any]:
+    access_token = get_graph_access_token()
+    teams = get_graph_teams(access_token)
+    messages = []
+    for team in teams:
+        team_path = quote(team["id"], safe="")
+        for channel in team["channels"]:
+            channel_path = quote(channel["id"], safe="")
+            graph_messages = graph_get_collection(
+                f"/teams/{team_path}/channels/{channel_path}/messages",
+                access_token,
+                params={"$top": "50"},
+            )
+            messages.extend(map_graph_message(message, team, channel) for message in graph_messages)
+    messages.sort(key=lambda message: message["timestamp"], reverse=True)
+    return {"teams": teams, "messages": messages, "source": "graph"}
+
+
+def get_demo_snapshot() -> dict[str, Any]:
+    teams = [
+        {
+            "id": team_id,
+            "name": team["name"],
+            "description": team["description"],
+            "channels": [
+                {"id": channel["id"], "name": channel["name"]} for channel in team["channels"]
+            ],
+        }
+        for team_id, team in app.state.teams.items()
+    ]
+    messages = []
+    for team_id, team in app.state.teams.items():
+        for channel in team["channels"]:
+            messages.extend(
+                {
+                    **message,
+                    "teamId": team_id,
+                    "teamName": team["name"],
+                    "channelId": channel["id"],
+                    "channelName": channel["name"],
+                }
+                for message in channel["messages"]
+            )
+    messages.sort(key=lambda message: message["timestamp"], reverse=True)
+    return {"teams": teams, "messages": messages, "source": "demo"}
+
+
+def get_dashboard_snapshot() -> dict[str, Any]:
+    if not graph_is_configured():
+        return get_demo_snapshot()
+    try:
+        return get_graph_snapshot()
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=f"Microsoft Graph 連携に失敗しました: {error}") from error
+
+
 def require_session(authorization: str | None = Header(default=None, alias="Authorization")) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="ログインしてください")
@@ -130,7 +302,17 @@ def health() -> dict[str, str]:
 def login(payload: dict[str, str]) -> dict[str, str]:
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
-    if username == "admin" and password == "admin123":
+    if graph_is_configured():
+        expected_username = os.getenv("APP_USERNAME", "").strip()
+        expected_password = os.getenv("APP_PASSWORD", "")
+        if not expected_username or not expected_password:
+            raise HTTPException(status_code=503, detail="APP_USERNAME と APP_PASSWORD を設定してください")
+        authenticated = hmac.compare_digest(username, expected_username) and hmac.compare_digest(
+            password, expected_password
+        )
+    else:
+        authenticated = username == "admin" and password == "admin123"
+    if authenticated:
         token = uuid.uuid4().hex
         app.state.sessions[token] = {"username": username}
         return {"token": token, "username": username}
@@ -139,7 +321,7 @@ def login(payload: dict[str, str]) -> dict[str, str]:
 
 @app.get("/", response_class=HTMLResponse)
 def root() -> str:
-    return """
+    page = """
     <!DOCTYPE html>
     <html lang="ja">
     <head>
@@ -148,59 +330,104 @@ def root() -> str:
         <title>Teams Data Viewer</title>
         <style>
             :root {
-                --bg: #f4f6fb;
-                --card: #ffffff;
-                --line: #dae1f0;
-                --primary: #2b6ef5;
-                --text: #1f2937;
-                --muted: #6b7280;
-                --success: #eaf8ee;
-                --success-text: #166534;
+                --bg: #f3f6f2;
+                --surface: #ffffff;
+                --line: #dce4dd;
+                --primary: #17634e;
+                --primary-dark: #104737;
+                --text: #1e2c26;
+                --muted: #68766e;
+                --accent: #e8ad4c;
+                --success: #e9f5e9;
+                --success-text: #28603d;
             }
             * { box-sizing: border-box; }
             body {
-                margin: 0; font-family: "Segoe UI", sans-serif; background: var(--bg); color: var(--text);
+                margin: 0; font-family: "Yu Gothic UI", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif;
+                background: radial-gradient(ellipse at 12% 0%, #e8f0e5 0, transparent 34rem), var(--bg); color: var(--text);
             }
             .container {
-                max-width: 1120px; margin: 48px auto; padding: 0 20px;
-            }
-            .login-box, .dashboard {
-                background: var(--card); border: 1px solid var(--line); border-radius: 18px; box-shadow: 0 12px 34px rgba(15, 23, 42, 0.08);
+                max-width: 1440px; margin: 36px auto; padding: 0 28px;
             }
             .login-box {
-                max-width: 420px; margin: 0 auto; padding: 32px 28px;
+                max-width: 440px; margin: 8vh auto; padding: 38px 34px; background: var(--surface);
+                border: 1px solid var(--line); border-top: 5px solid var(--primary); box-shadow: 0 18px 48px rgba(28, 54, 41, .08);
             }
-            .dashboard { display: none; padding: 24px; }
+            .dashboard { display: none; }
             .dashboard.visible { display: block; }
-            h1 { margin-top: 0; font-size: 2rem; }
-            .subtitle { color: var(--muted); margin-bottom: 20px; }
-            label { display: block; margin: 16px 0 8px; font-weight: 600; }
-            input, textarea, button {
-                width: 100%; border-radius: 10px; border: 1px solid var(--line); padding: 12px 14px; font-size: 1rem;
+            h1, h2, p { margin-top: 0; }
+            h1 { margin-bottom: 8px; font-size: 2rem; letter-spacing: 0; }
+            h2 { margin-bottom: 0; font-size: 1.08rem; }
+            .subtitle { color: var(--muted); margin-bottom: 20px; line-height: 1.7; }
+            label { display: block; margin: 14px 0 7px; font-size: .88rem; font-weight: 700; }
+            input, textarea, select, button {
+                width: 100%; border: 1px solid var(--line); padding: 11px 12px; font: inherit; font-size: .94rem;
             }
-            input, textarea { background: #f9fafb; }
-            button {
-                margin-top: 18px; background: var(--primary); color: white; border: none; cursor: pointer; font-weight: 600;
+            input, textarea, select { background: #fbfcfa; color: var(--text); }
+            button { cursor: pointer; font-weight: 700; }
+            button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+                outline: 3px solid rgba(23, 99, 78, .2); outline-offset: 2px;
             }
             .demo-note { margin-top: 12px; font-size: 0.86rem; color: var(--muted); }
-            .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
-            .topbar .meta { color: var(--muted); }
-            .layout { display: grid; grid-template-columns: minmax(260px, 1.1fr) minmax(320px, 1.8fr); gap: 20px; }
-            table { width: 100%; border-collapse: collapse; background: #fff; }
-            th, td { padding: 12px 10px; border-bottom: 1px solid var(--line); text-align: left; }
-            tbody tr { cursor: pointer; }
-            tbody tr:hover { background: #f7faff; }
-            tbody tr.selected { background: #eef4ff; }
-            .channel-list { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
-            .channel-item { background: #eef4ff; color: #1a4ebd; border-radius: 999px; padding: 8px 12px; cursor: pointer; }
-            .channel-item.active { background: var(--primary); color: white; }
-            .messages { margin-top: 18px; border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-height: 160px; }
-            .message { padding: 12px 0; border-bottom: 1px solid var(--line); }
-            .message:last-child { border-bottom: none; }
-            .message-head { font-size: 0.82rem; color: var(--muted); margin-bottom: 5px; }
-            .empty { color: var(--muted); padding: 18px 0; }
-            .success { background: var(--success); color: var(--success-text); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; display: none; }
+            .topbar { display: flex; justify-content: space-between; align-items: center; min-height: 64px; border-bottom: 1px solid var(--line); }
+            .brand { display: flex; align-items: center; gap: 11px; color: var(--primary-dark); font-size: .93rem; font-weight: 800; }
+            .brand-mark { display: grid; place-items: center; width: 30px; height: 30px; background: var(--primary); color: white; font-size: .78rem; }
+            .user-area { display: flex; align-items: center; gap: 16px; color: var(--muted); font-size: .88rem; }
+            .logout-button { width: auto; padding: 8px 12px; background: transparent; color: var(--primary-dark); }
+            .page-heading { display: flex; align-items: end; justify-content: space-between; gap: 24px; padding: 34px 0 26px; }
+            .eyebrow { margin-bottom: 8px; color: var(--primary); font-size: .72rem; font-weight: 800; letter-spacing: .08em; }
+            .page-heading p:not(.eyebrow) { margin-bottom: 0; color: var(--muted); }
+            .sample-label { align-self: start; padding: 6px 9px; border: 1px solid #e8d3aa; color: #79551e; background: #fff8e9; font-size: .76rem; white-space: nowrap; }
+            .home-grid { display: grid; grid-template-columns: 220px minmax(0, 1fr) 286px; gap: 26px; align-items: start; }
+            .team-panel, .feed-panel, .compose-panel { min-width: 0; }
+            .section-heading, .feed-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+            .section-heading { padding: 0 0 12px; border-bottom: 1px solid var(--line); }
+            .section-count { color: var(--muted); font-size: .8rem; }
+            .team-list { display: grid; }
+            .team-option { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 10px; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--text); text-align: left; font-weight: 600; }
+            .team-option:hover, .team-option.active { background: #e8f0e9; color: var(--primary-dark); }
+            .team-option span:last-child { min-width: 24px; color: var(--muted); text-align: right; font-size: .8rem; }
+            .feed-toolbar { padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+            .feed-toolbar p { margin: 5px 0 0; color: var(--muted); font-size: .82rem; }
+            .refresh-button { width: auto; padding: 8px 10px; background: transparent; color: var(--primary); font-size: .84rem; }
+            .feed-list { min-height: 250px; }
+            .feed-item { display: grid; grid-template-columns: 9px minmax(0, 1fr); gap: 14px; padding: 18px 2px; border-bottom: 1px solid var(--line); animation: arrive .25s ease both; }
+            .feed-marker { width: 7px; height: 7px; margin-top: 7px; background: var(--accent); }
+            .feed-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; color: var(--muted); font-size: .77rem; }
+            .feed-team { color: var(--primary); font-weight: 800; }
+            .feed-separator { color: #a4aea7; }
+            .feed-time { margin-left: auto; }
+            .feed-author { margin-top: 7px; font-size: .87rem; font-weight: 700; }
+            .feed-content { margin: 5px 0 0; line-height: 1.7; overflow-wrap: anywhere; }
+            .empty-state { padding: 42px 12px; color: var(--muted); text-align: center; }
+            .compose-panel { padding-left: 20px; border-left: 1px solid var(--line); }
+            .compose-panel h2 { margin-bottom: 8px; }
+            .compose-hint { margin-bottom: 14px; color: var(--muted); font-size: .85rem; line-height: 1.6; }
+            .compose-button, .login-button { margin-top: 14px; border: 0; background: var(--primary); color: white; }
+            .compose-button:hover, .login-button:hover { background: var(--primary-dark); }
+            .success { display: none; margin-bottom: 16px; padding: 10px 12px; background: var(--success); color: var(--success-text); }
             .success.show { display: block; }
+            @keyframes arrive { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+            @media (max-width: 1080px) {
+                .home-grid { grid-template-columns: 190px minmax(0, 1fr); gap: 24px; }
+                .compose-panel { grid-column: 1 / -1; padding: 20px 0 0; border-left: 0; border-top: 1px solid var(--line); }
+                .compose-panel form { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+                .compose-panel label[for="newMessage"], #newMessage, .compose-button { grid-column: 1 / -1; }
+            }
+            @media (max-width: 680px) {
+                .container { margin: 0 auto; padding: 0 16px 28px; }
+                .login-box { margin: 8vh auto; padding: 30px 22px; }
+                .topbar { min-height: 58px; }
+                .user-area { gap: 8px; font-size: .8rem; }
+                .page-heading { align-items: start; padding: 26px 0 20px; }
+                h1 { font-size: 1.7rem; }
+                .home-grid { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+                .team-list { display: flex; overflow-x: auto; }
+                .team-option { flex: 0 0 auto; border: 1px solid var(--line); margin-right: 7px; padding: 9px 10px; }
+                .feed-time { flex-basis: 100%; margin-left: 0; }
+                .compose-panel form { display: block; }
+                .compose-panel label[for="newMessage"], #newMessage, .compose-button { grid-column: auto; }
+            }
         </style>
     </head>
     <body>
@@ -208,51 +435,64 @@ def root() -> str:
             <div id="loginBox" class="login-box">
                 <h1>Teams Data Viewer</h1>
                 <div class="subtitle">学校の Microsoft 365 環境向けに Teams データを確認するためのログイン画面です。</div>
-                <form id="loginForm">
+                <form id="loginForm" method="post" action="/api/login">
                     <label for="username">ユーザー名</label>
-                    <input id="username" name="username" value="admin" required />
+                    <input id="username" name="username" autocomplete="username" required />
                     <label for="password">パスワード</label>
-                    <input id="password" name="password" type="password" value="admin123" required />
+                    <input id="password" name="password" type="password" autocomplete="current-password" required />
                     <button type="submit">ログイン</button>
                 </form>
-                <div class="demo-note">デモ用: admin / admin123</div>
+                <div id="loginHelp" class="demo-note">__LOGIN_HELP__</div>
             </div>
 
             <div id="dashboard" class="dashboard">
                 <div class="topbar">
-                    <div>
-                        <h1>Teams ダッシュボード</h1>
-                        <div class="meta">ログイン中: <span id="currentUser"></span></div>
+                    <div class="brand"><span class="brand-mark">T</span><span>学校連絡</span></div>
+                    <div class="user-area"><span><span id="currentUser"></span> でログイン中</span>
+                        <button id="logoutButton" class="logout-button" type="button">ログアウト</button>
                     </div>
-                    <button id="logoutButton" type="button" style="width:auto; background:#475569;">ログアウト</button>
                 </div>
+
+                <section class="page-heading">
+                    <div>
+                        <p class="eyebrow">TEAM COMMUNICATIONS</p>
+                        <h1>連絡ホーム</h1>
+                        <p>チームから届いた連絡をまとめて確認できます。</p>
+                    </div>
+                    <span id="sourceLabel" class="sample-label">現在はサンプルデータを表示</span>
+                </section>
 
                 <div id="messageBox" class="success"></div>
 
-                <div class="layout">
-                    <div>
-                        <h2>チーム一覧</h2>
-                        <table>
-                            <thead>
-                                <tr><th>チーム名</th><th>説明</th><th>チャネル数</th></tr>
-                            </thead>
-                            <tbody id="teamTableBody"></tbody>
-                        </table>
-                    </div>
+                <div class="home-grid">
+                    <aside class="team-panel">
+                        <div class="section-heading"><h2>チーム</h2><span id="teamCount" class="section-count"></span></div>
+                        <nav id="teamList" class="team-list" aria-label="チーム別に連絡を絞り込む"></nav>
+                    </aside>
 
-                    <div>
-                        <h2>チャネル</h2>
-                        <div id="channelList" class="channel-list"></div>
+                    <section class="feed-panel" aria-labelledby="feedHeading">
+                        <div class="feed-toolbar">
+                            <div><h2 id="feedHeading">最新の連絡</h2><p id="feedMeta">すべてのチーム</p></div>
+                            <button id="refreshButton" class="refresh-button" type="button">再読み込み</button>
+                        </div>
+                        <div id="feedList" class="feed-list" aria-live="polite"></div>
+                    </section>
 
-                        <h2 style="margin-top: 24px;">メッセージ一覧</h2>
-                        <div id="messages" class="messages"></div>
-
-                        <form id="messageForm" style="margin-top: 18px;">
-                            <label for="newMessage">新規投稿</label>
-                            <textarea id="newMessage" rows="4" placeholder="投稿内容を入力"></textarea>
-                            <button type="submit">投稿を追加</button>
+                    <aside class="compose-panel">
+                        <p class="eyebrow">QUICK POST</p>
+                        <h2>チャネルに投稿</h2>
+                        <p class="compose-hint">投稿先を選んでチームに連絡します。</p>
+                        <p id="readOnlyNote" class="compose-hint" hidden>Graph 接続中は閲覧専用です。投稿にはユーザー委任認証が必要です。</p>
+                        <form id="messageForm">
+                            <label for="teamSelect">チーム</label>
+                            <select id="teamSelect" required></select>
+                            <label for="channelSelect">チャネル</label>
+                            <select id="channelSelect" required></select>
+                            <label for="newMessage">メッセージ</label>
+                            <textarea id="newMessage" rows="5" placeholder="連絡内容を入力" required></textarea>
+                            <button class="compose-button" type="submit">投稿する</button>
                         </form>
-                    </div>
+                    </aside>
                 </div>
             </div>
         </div>
@@ -261,23 +501,34 @@ def root() -> str:
             const state = {
                 token: localStorage.getItem('teamsToken') || '',
                 teams: [],
-                selectedTeamId: null,
-                selectedChannelId: null,
+                messages: [],
+                source: 'demo',
+                selectedTeamId: '',
+                selectedChannelId: '',
+                selectedTeamFilter: '',
                 user: localStorage.getItem('teamsUser') || ''
             };
 
             const loginBox = document.getElementById('loginBox');
             const dashboard = document.getElementById('dashboard');
-            const teamTableBody = document.getElementById('teamTableBody');
-            const channelList = document.getElementById('channelList');
-            const messagesBox = document.getElementById('messages');
+            const teamList = document.getElementById('teamList');
+            const feedList = document.getElementById('feedList');
+            const feedMeta = document.getElementById('feedMeta');
             const currentUser = document.getElementById('currentUser');
             const messageBox = document.getElementById('messageBox');
+            const teamSelect = document.getElementById('teamSelect');
+            const channelSelect = document.getElementById('channelSelect');
 
             function showMessage(text) {
                 messageBox.textContent = text;
                 messageBox.classList.add('show');
                 setTimeout(() => messageBox.classList.remove('show'), 2500);
+            }
+
+            function escapeHtml(value) {
+                return String(value ?? '').replace(/[&<>"']/g, character => ({
+                    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+                })[character]);
             }
 
             function setAuthUI() {
@@ -295,84 +546,106 @@ def root() -> str:
                 return fetch(url, { ...options, headers });
             }
 
-            async function loadTeams() {
-                const response = await authFetch('/api/teams');
-                if (!response.ok) {
-                    throw new Error('チーム一覧の取得に失敗しました');
-                }
-                const data = await response.json();
-                state.teams = data.teams || [];
-                if (!state.teams.length) {
-                    teamTableBody.innerHTML = '<tr><td colspan="3">チームがありません</td></tr>';
-                    return;
-                }
-                if (!state.selectedTeamId) {
-                    state.selectedTeamId = state.teams[0].id;
-                }
-                teamTableBody.innerHTML = state.teams.map(team => {
-                    const selected = team.id === state.selectedTeamId ? 'selected' : '';
-                    return `<tr data-team-id="${team.id}" class="${selected}">
-                        <td>${team.name}</td>
-                        <td>${team.description || ''}</td>
-                        <td>${(team.channels || []).length}</td>
-                    </tr>`;
-                }).join('');
-
-                teamTableBody.querySelectorAll('tr[data-team-id]').forEach(row => {
-                    row.addEventListener('click', () => {
-                        state.selectedTeamId = row.dataset.teamId;
-                        loadTeams();
-                        loadChannels();
-                    });
-                });
-
-                await loadChannels();
-            }
-
-            async function loadChannels() {
-                if (!state.selectedTeamId) return;
-                const team = state.teams.find(item => item.id === state.selectedTeamId);
-                if (!team) return;
-                const channels = team.channels || [];
-                if (!channels.length) {
-                    channelList.innerHTML = '<span class="empty">チャネルがありません</span>';
-                    messagesBox.innerHTML = '<div class="empty">メッセージはまだありません</div>';
-                    return;
-                }
-                if (!state.selectedChannelId || !channels.some(ch => ch.id === state.selectedChannelId)) {
-                    state.selectedChannelId = channels[0].id;
-                }
-                channelList.innerHTML = channels.map(channel => `
-                    <button type="button" class="channel-item ${channel.id === state.selectedChannelId ? 'active' : ''}" data-channel-id="${channel.id}">${channel.name}</button>
+            function renderTeams() {
+                document.getElementById('teamCount').textContent = `${state.teams.length} チーム`;
+                const allCount = state.messages.length;
+                const options = [{ id: '', name: 'すべての連絡', count: allCount }, ...state.teams.map(team => ({
+                    id: team.id,
+                    name: team.name,
+                    count: state.messages.filter(message => message.teamId === team.id).length
+                }))];
+                teamList.innerHTML = options.map(team => `
+                    <button class="team-option ${team.id === state.selectedTeamFilter ? 'active' : ''}" type="button" data-team-filter="${escapeHtml(team.id)}">
+                        <span>${escapeHtml(team.name)}</span><span>${team.count}</span>
+                    </button>
                 `).join('');
-                channelList.querySelectorAll('.channel-item').forEach(button => {
+                teamList.querySelectorAll('[data-team-filter]').forEach(button => {
                     button.addEventListener('click', () => {
-                        state.selectedChannelId = button.dataset.channelId;
-                        loadChannels();
+                        state.selectedTeamFilter = button.dataset.teamFilter;
+                        renderTeams();
+                        renderFeed();
                     });
                 });
-                await loadMessages();
             }
 
-            async function loadMessages() {
-                if (!state.selectedTeamId || !state.selectedChannelId) return;
-                const response = await authFetch(`/api/teams/${state.selectedTeamId}/channels/${state.selectedChannelId}/messages`);
-                if (!response.ok) {
-                    messagesBox.innerHTML = '<div class="empty">メッセージを取得できませんでした。</div>';
+            function renderChannels() {
+                teamSelect.innerHTML = state.teams.map(team =>
+                    `<option value="${escapeHtml(team.id)}">${escapeHtml(team.name)}</option>`
+                ).join('');
+                if (!state.teams.some(team => team.id === state.selectedTeamId)) {
+                    state.selectedTeamId = state.teams[0]?.id || '';
+                }
+                teamSelect.value = state.selectedTeamId;
+                const selectedTeam = state.teams.find(team => team.id === state.selectedTeamId);
+                const channels = selectedTeam?.channels || [];
+                if (!channels.some(channel => channel.id === state.selectedChannelId)) {
+                    state.selectedChannelId = channels[0]?.id || '';
+                }
+                channelSelect.innerHTML = channels.map(channel =>
+                    `<option value="${escapeHtml(channel.id)}">${escapeHtml(channel.name)}</option>`
+                ).join('');
+                channelSelect.value = state.selectedChannelId;
+                teamSelect.disabled = !state.teams.length;
+                channelSelect.disabled = !channels.length;
+            }
+
+            function renderFeed() {
+                const visibleMessages = state.selectedTeamFilter
+                    ? state.messages.filter(message => message.teamId === state.selectedTeamFilter)
+                    : state.messages;
+                const selectedTeam = state.teams.find(team => team.id === state.selectedTeamFilter);
+                feedMeta.textContent = `${selectedTeam ? selectedTeam.name : 'すべてのチーム'} ・ ${visibleMessages.length} 件`;
+                if (!visibleMessages.length) {
+                    feedList.innerHTML = '<div class="empty-state">表示できる連絡はありません。</div>';
                     return;
                 }
-                const data = await response.json();
-                const messages = data.messages || [];
-                if (!messages.length) {
-                    messagesBox.innerHTML = '<div class="empty">メッセージはまだありません。</div>';
-                    return;
-                }
-                messagesBox.innerHTML = messages.map(msg => `
-                    <div class="message">
-                        <div class="message-head">${msg.author}・${new Date(msg.timestamp).toLocaleString('ja-JP')}</div>
-                        <div>${(msg.content || '').replace(/\n/g, '<br>')}</div>
-                    </div>
+                feedList.innerHTML = visibleMessages.map(message => `
+                    <article class="feed-item">
+                        <span class="feed-marker" aria-hidden="true"></span>
+                        <div>
+                            <div class="feed-meta">
+                                <span class="feed-team">${escapeHtml(message.teamName)}</span>
+                                <span class="feed-separator">/</span>
+                                <span>${escapeHtml(message.channelName)}</span>
+                                <time class="feed-time" datetime="${escapeHtml(message.timestamp)}">${new Date(message.timestamp).toLocaleString('ja-JP')}</time>
+                            </div>
+                            <div class="feed-author">${escapeHtml(message.author)}</div>
+                            <p class="feed-content">${escapeHtml(message.content).replace(/\\n/g, '<br>')}</p>
+                        </div>
+                    </article>
                 `).join('');
+            }
+
+            async function loadDashboard() {
+                const response = await authFetch('/api/dashboard');
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.detail || '連絡ホームの読み込みに失敗しました');
+                }
+                state.teams = data.teams || [];
+                state.messages = data.messages || [];
+                state.source = data.source || 'demo';
+                const isGraph = state.source === 'graph';
+                document.getElementById('sourceLabel').textContent = isGraph
+                    ? 'Microsoft Teams から取得'
+                    : '現在はサンプルデータを表示';
+                document.getElementById('messageForm').hidden = isGraph;
+                document.getElementById('readOnlyNote').hidden = !isGraph;
+                renderChannels();
+                renderTeams();
+                renderFeed();
+            }
+
+            async function loadFeed() {
+                const response = await authFetch('/api/messages');
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.detail || '連絡一覧の取得に失敗しました');
+                }
+                state.messages = data.messages || [];
+                state.source = data.source || state.source;
+                renderTeams();
+                renderFeed();
             }
 
             document.getElementById('loginForm').addEventListener('submit', async (event) => {
@@ -396,7 +669,11 @@ def root() -> str:
                 localStorage.setItem('teamsToken', state.token);
                 localStorage.setItem('teamsUser', state.user);
                 setAuthUI();
-                await loadTeams();
+                try {
+                    await loadDashboard();
+                } catch (error) {
+                    showMessage(error.message || '連絡ホームを読み込めませんでした');
+                }
             });
 
             document.getElementById('logoutButton').addEventListener('click', () => {
@@ -405,6 +682,20 @@ def root() -> str:
                 localStorage.removeItem('teamsToken');
                 localStorage.removeItem('teamsUser');
                 setAuthUI();
+            });
+
+            teamSelect.addEventListener('change', () => {
+                state.selectedTeamId = teamSelect.value;
+                state.selectedChannelId = '';
+                renderChannels();
+            });
+
+            channelSelect.addEventListener('change', () => {
+                state.selectedChannelId = channelSelect.value;
+            });
+
+            document.getElementById('refreshButton').addEventListener('click', () => {
+                loadFeed().catch(() => showMessage('連絡一覧を更新できませんでした'));
             });
 
             document.getElementById('messageForm').addEventListener('submit', async (event) => {
@@ -423,13 +714,13 @@ def root() -> str:
                 }
                 document.getElementById('newMessage').value = '';
                 showMessage('投稿を追加しました');
-                await loadMessages();
+                await loadFeed();
             });
 
             if (state.token) {
                 setAuthUI();
-                loadTeams().catch(() => {
-                    alert('チーム一覧の取得に失敗しました');
+                loadDashboard().catch((error) => {
+                    showMessage(error.message || '連絡ホームを読み込めませんでした');
                 });
             } else {
                 setAuthUI();
@@ -438,30 +729,42 @@ def root() -> str:
     </body>
     </html>
     """
+    login_help = (
+        "APP_USERNAME と APP_PASSWORD に設定したアカウントでログインしてください。"
+        if graph_is_configured()
+        else "デモ用: admin / admin123"
+    )
+    return page.replace("__LOGIN_HELP__", login_help)
 
 
 @app.get("/api/teams")
 def get_joined_teams(authorization: str | None = Header(default=None, alias="Authorization")) -> dict[str, Any]:
     require_session(authorization)
-    teams = []
-    for team_id, team in app.state.teams.items():
-        teams.append(
-            {
-                "id": team_id,
-                "name": team["name"],
-                "description": team["description"],
-                "channels": [
-                    {"id": channel["id"], "name": channel["name"]} for channel in team["channels"]
-                ],
-            }
-        )
-    return {"teams": teams}
+    snapshot = get_dashboard_snapshot()
+    return {"teams": snapshot["teams"], "source": snapshot["source"]}
+
+
+@app.get("/api/dashboard")
+def get_dashboard(authorization: str | None = Header(default=None, alias="Authorization")) -> dict[str, Any]:
+    require_session(authorization)
+    return get_dashboard_snapshot()
+
+
+@app.get("/api/messages")
+def get_all_messages(authorization: str | None = Header(default=None, alias="Authorization")) -> dict[str, Any]:
+    require_session(authorization)
+    snapshot = get_dashboard_snapshot()
+    return {"messages": snapshot["messages"], "source": snapshot["source"]}
 
 
 @app.get("/api/teams/{team_id}/channels")
 def get_team_channels(team_id: str, authorization: str | None = Header(default=None, alias="Authorization")) -> dict[str, Any]:
     require_session(authorization)
-    team = app.state.teams.get(team_id)
+    if graph_is_configured():
+        snapshot = get_dashboard_snapshot()
+        team = next((item for item in snapshot["teams"] if item["id"] == team_id), None)
+    else:
+        team = app.state.teams.get(team_id)
     if team is None:
         raise HTTPException(status_code=404, detail="チームが見つかりません")
     return {
@@ -478,6 +781,20 @@ def get_channel_messages(
     authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> dict[str, Any]:
     require_session(authorization)
+    if graph_is_configured():
+        snapshot = get_dashboard_snapshot()
+        team = next((item for item in snapshot["teams"] if item["id"] == team_id), None)
+        if team is None:
+            raise HTTPException(status_code=404, detail="チームが見つかりません")
+        channel = next((item for item in team["channels"] if item["id"] == channel_id), None)
+        if channel is None:
+            raise HTTPException(status_code=404, detail="チャネルが見つかりません")
+        messages = [
+            message
+            for message in snapshot["messages"]
+            if message["teamId"] == team_id and message["channelId"] == channel_id
+        ]
+        return {"teamId": team_id, "channelId": channel_id, "messages": messages}
     team = app.state.teams.get(team_id)
     if team is None:
         raise HTTPException(status_code=404, detail="チームが見つかりません")
@@ -495,6 +812,8 @@ def create_channel_message(
     authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> dict[str, Any]:
     require_session(authorization)
+    if graph_is_configured():
+        raise HTTPException(status_code=405, detail="Graph 接続中は閲覧専用です")
     team = app.state.teams.get(team_id)
     if team is None:
         raise HTTPException(status_code=404, detail="チームが見つかりません")

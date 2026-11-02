@@ -21,13 +21,12 @@
 
 1. Microsoft Entra ID の App registrations で新しいアプリを作成
 2. API permissions に以下を追加
-   - `Group.Read.All`
-   - `Channel.ReadBasic.All`
-   - `ChannelMessage.Read.All`
-   - `TeamSettings.Read.All`
-   - `User.Read`
-3. 「Certificates & secrets」からクライアントシークレットを発行
-4. テナントID / クライアントID / クライアントシークレットを `.env` に設定
+   - `Group.Read.All` (Application)
+   - `Channel.ReadBasic.All` (Application)
+   - `ChannelMessage.Read.All` (Application)
+3. テナント管理者の同意を付与
+4. 「Certificates & secrets」からクライアントシークレットを発行
+5. Microsoft Graph の接続情報とアプリのログイン情報を `.env` に設定
 
 ## 環境変数
 
@@ -35,7 +34,11 @@
 TENANT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 CLIENT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+APP_USERNAME=trusted-operator
+APP_PASSWORD=replace-with-a-long-random-password
 ```
+
+Graph 接続時はアプリ専用権限でテナント内の Teams 投稿を読み取ります。画面は読み取り専用で、投稿機能にはユーザー委任認証が別途必要です。アプリ専用権限はサインイン中の利用者ごとの Teams 権限には限定されないため、管理者の同意とアプリへのアクセスを厳格に管理してください。利用者単位でアクセスを制御する本番運用では、Microsoft Entra ID の委任認証を実装してください。
 
 ## 実行方法
 
