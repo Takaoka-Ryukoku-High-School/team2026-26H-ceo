@@ -1,297 +1,530 @@
-import json
-from pathlib import Path
-from uuid import uuid4
+import os
+import uuid
+from typing import Any
 
-import flet as ft
+import msal
+import requests
+from dotenv import load_dotenv
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse
 
+load_dotenv()
 
-DATA_FILE = Path.home() / ".daily_note_tasks.json"
-GREEN = "#2E6654"
-GREEN_LIGHT = "#E2EDE5"
-PAPER = "#F6F5EF"
-INK = "#202C2A"
-MUTED = "#77807B"
-CORAL = "#CF6048"
-
-
-def load_tasks():
-    try:
-        tasks = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        if isinstance(tasks, list):
-            return [
-                task
-                for task in tasks
-                if isinstance(task, dict)
-                and isinstance(task.get("id"), str)
-                and isinstance(task.get("text"), str)
-                and isinstance(task.get("done"), bool)
-            ]
-    except (OSError, json.JSONDecodeError):
-        pass
-    return []
+app = FastAPI(title="Teams Data Viewer", version="0.1.0")
+GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
 
-def save_tasks(tasks):
-    DATA_FILE.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def main(page: ft.Page):
-    page.title = "今日の段取り | ToDo"
-    page.theme_mode = ft.ThemeMode.LIGHT
-    page.bgcolor = PAPER
-    page.padding = 24
-    page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
-    page.scroll = ft.ScrollMode.AUTO
-
-    tasks = load_tasks()
-    current_filter = "all"
-
-    task_input = ft.TextField(
-        hint_text="次にやることは？",
-        expand=True,
-        autofocus=True,
-        border_radius=6,
-        border_color="#D4DED5",
-        focused_border_color=GREEN,
-        bgcolor="#FFFEFA",
-        text_size=15,
-        on_submit=lambda event: add_task(event),
-    )
-    task_list = ft.Column(spacing=0)
-    task_count = ft.Text(color=MUTED, size=12)
-    progress_label = ft.Text(color=MUTED, size=11)
-    clear_done_button = ft.TextButton(
-        "完了した項目を削除",
-        icon=ft.Icons.DELETE_OUTLINE,
-        style=ft.ButtonStyle(color=CORAL),
-        on_click=lambda event: clear_done(event),
-    )
-    filter_buttons = {}
-
-    def persist():
-        try:
-            save_tasks(tasks)
-            progress_label.value = f"{sum(task['done'] for task in tasks)} / {len(tasks)} 件 完了"
-        except OSError:
-            progress_label.value = "保存できませんでした。書き込み権限をご確認ください。"
-
-    def set_filter(value):
-        nonlocal current_filter
-        current_filter = value
-        render()
-
-    def add_task(event):
-        text = task_input.value.strip()
-        if not text:
-            return
-        tasks.insert(0, {"id": str(uuid4()), "text": text, "done": False})
-        task_input.value = ""
-        persist()
-        set_filter("all")
-
-    def toggle_task(task_id):
-        for task in tasks:
-            if task["id"] == task_id:
-                task["done"] = not task["done"]
-                break
-        persist()
-        render()
-
-    def delete_task(task_id):
-        tasks[:] = [task for task in tasks if task["id"] != task_id]
-        persist()
-        render()
-
-    def clear_done(event):
-        tasks[:] = [task for task in tasks if not task["done"]]
-        persist()
-        render()
-
-    def render():
-        visible_tasks = [
-            task
-            for task in tasks
-            if current_filter == "all"
-            or (current_filter == "active" and not task["done"])
-            or (current_filter == "done" and task["done"])
-        ]
-        remaining = sum(not task["done"] for task in tasks)
-        completed = len(tasks) - remaining
-        task_count.value = f"未完了 {remaining} 件"
-        progress_label.value = (
-            f"{completed} / {len(tasks)} 件 完了" if tasks else "タスクはまだありません"
-        )
-        clear_done_button.visible = completed > 0
-
-        for key, button in filter_buttons.items():
-            selected = key == current_filter
-            button.style = ft.ButtonStyle(
-                color=GREEN if selected else MUTED,
-                bgcolor=GREEN_LIGHT if selected else "transparent",
-                shape=ft.RoundedRectangleBorder(radius=4),
-            )
-
-        rows = []
-        for task in visible_tasks:
-            checkbox = ft.Checkbox(
-                value=task["done"],
-                label=task["text"],
-                expand=True,
-                active_color=GREEN,
-                label_style=ft.TextStyle(
-                    color="#929992" if task["done"] else INK,
-                    decoration=ft.TextDecoration.LINE_THROUGH if task["done"] else None,
-                    size=14,
-                ),
-                on_change=lambda event, task_id=task["id"]: toggle_task(task_id),
-            )
-            delete_button = ft.IconButton(
-                icon=ft.Icons.DELETE_OUTLINE,
-                icon_color=MUTED,
-                tooltip=f"「{task['text']}」を削除",
-                on_click=lambda event, task_id=task["id"]: delete_task(task_id),
-            )
-            rows.extend(
-                [
-                    ft.Row([checkbox, delete_button], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                    ft.Divider(height=1, thickness=1, color="#DEDFD5"),
-                ]
-            )
-
-        if not visible_tasks:
-            empty_text = (
-                "未完了のタスクはありません。いい調子！"
-                if current_filter == "active" and tasks
-                else "完了したタスクはまだありません。"
-                if current_filter == "done" and tasks
-                else "まずは、やることをひとつ書いてみましょう。"
-            )
-            rows = [
-                ft.Container(
-                    content=ft.Column(
-                        [
-                            ft.Text("○", size=24, color="#9A7629", text_align=ft.TextAlign.CENTER),
-                            ft.Text(empty_text, size=13, color=MUTED, text_align=ft.TextAlign.CENTER),
-                        ],
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                        spacing=10,
-                    ),
-                    padding=32,
-                    alignment=ft.Alignment.CENTER,
-                )
-            ]
-
-        task_list.controls = rows
-        page.update()
-
-    for key, label in (("all", "すべて"), ("active", "未完了"), ("done", "完了")):
-        filter_buttons[key] = ft.TextButton(
-            label,
-            on_click=lambda event, value=key: set_filter(value),
-        )
-
-    today = ft.Text(
-        __import__("datetime").date.today().strftime("%Y年%m月%d日"),
-        size=12,
-        color=MUTED,
-    )
-    composer = ft.Row(
-        [
-            task_input,
-            ft.Button(
-                "追加  ＋",
-                on_click=add_task,
-                bgcolor=GREEN,
-                color="white",
-                height=48,
-                style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=5)),
-            ),
-        ],
-        spacing=10,
-    )
-
-    content = ft.Column(
-        [
-            ft.Row(
-                [
-                    ft.Row(
-                        [
-                            ft.Container(
-                                content=ft.Text("日", color="white", size=15, weight=ft.FontWeight.BOLD),
-                                width=28,
-                                height=28,
-                                bgcolor=GREEN,
-                                border_radius=14,
-                                alignment=ft.Alignment.CENTER,
-                            ),
-                            ft.Text("DAILY NOTE", size=12, color=GREEN, weight=ft.FontWeight.BOLD),
-                        ],
-                        spacing=10,
-                    ),
-                    today,
-                ],
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-            ),
-            ft.Column(
-                [
-                    ft.Text("今日の段取り", size=38, color=INK, weight=ft.FontWeight.W_600),
-                    ft.Text("ひとつずつ、進めていこう。", size=13, color=MUTED),
-                ],
-                spacing=4,
-            ),
-            ft.Container(
-                content=ft.Column(
-                    [
-                        ft.Container(content=composer, padding=18, bgcolor=GREEN_LIGHT),
-                        ft.Container(
-                            content=ft.Row(
-                                [ft.Row(list(filter_buttons.values()), spacing=0), task_count],
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                            ),
-                            padding=ft.Padding(left=18, right=18, top=8, bottom=8),
-                            border=ft.Border.only(bottom=ft.BorderSide(1, "#DEDFD5")),
-                        ),
-                        ft.Container(content=task_list, padding=ft.Padding.symmetric(horizontal=18)),
-                        ft.Container(
-                            content=ft.Row(
-                                [progress_label, clear_done_button],
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            ),
-                            padding=ft.Padding(left=18, right=18, top=8, bottom=8),
-                            border=ft.Border.only(top=ft.BorderSide(1, "#DEDFD5")),
-                        ),
+def _make_demo_data() -> dict[str, dict[str, Any]]:
+    return {
+        "team-101": {
+            "id": "team-101",
+            "name": "学校運営",
+            "description": "学校の運営情報と共有事項",
+            "channels": [
+                {
+                    "id": "channel-general",
+                    "name": "全体連絡",
+                    "messages": [
+                        {
+                            "id": "msg-1",
+                            "author": "山田先生",
+                            "content": "今週の校内ミーティングは木曜の 3 時限に実施します。",
+                            "timestamp": "2026-10-26T09:00:00Z",
+                        },
+                        {
+                            "id": "msg-2",
+                            "author": "佐藤さん",
+                            "content": "準備資料の共有をお願いします。",
+                            "timestamp": "2026-10-26T09:40:00Z",
+                        },
                     ],
-                    spacing=0,
-                ),
-                width=700,
-                bgcolor="#FFFEFA",
-                border=ft.Border.all(1, "#E3E3D9"),
-                border_radius=8,
-                shadow=ft.BoxShadow(blur_radius=28, color="#182D2314", offset=ft.Offset(0, 10)),
-                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            ),
-        ],
-        width=700,
-        spacing=28,
+                },
+                {
+                    "id": "channel-admin",
+                    "name": "管理",
+                    "messages": [
+                        {
+                            "id": "msg-3",
+                            "author": "校務担当",
+                            "content": "教材の発注予定を確認しています。",
+                            "timestamp": "2026-10-26T10:00:00Z",
+                        }
+                    ],
+                },
+            ],
+        },
+        "team-202": {
+            "id": "team-202",
+            "name": "進路サポート",
+            "description": "進路指導・相談の共有",
+            "channels": [
+                {
+                    "id": "channel-career",
+                    "name": "進路相談",
+                    "messages": [
+                        {
+                            "id": "msg-4",
+                            "author": "進路担当",
+                            "content": "面談の予約枠を追加しました。",
+                            "timestamp": "2026-10-26T11:00:00Z",
+                        }
+                    ],
+                },
+                {
+                    "id": "channel-announce",
+                    "name": "お知らせ",
+                    "messages": [],
+                },
+            ],
+        },
+    }
+
+
+app.state.sessions: dict[str, dict[str, str]] = {}
+app.state.teams = _make_demo_data()
+
+
+def get_m365_config() -> dict[str, str]:
+    return {
+        "tenant_id": os.getenv("TENANT_ID", ""),
+        "client_id": os.getenv("CLIENT_ID", ""),
+        "client_secret": os.getenv("CLIENT_SECRET", ""),
+    }
+
+
+def get_graph_access_token() -> str:
+    config = get_m365_config()
+    if not all(config.values()):
+        raise RuntimeError(
+            "Microsoft 365 の環境変数 TENANT_ID / CLIENT_ID / CLIENT_SECRET を設定してください。"
+        )
+
+    msal_client = msal.ConfidentialClientApplication(
+        client_id=config["client_id"],
+        authority=f"https://login.microsoftonline.com/{config['tenant_id']}",
+        client_credential=config["client_secret"],
     )
 
-    app_container = ft.Container(content=content, width=700, padding=ft.Padding.only(top=18, bottom=32))
-    workspace_card = content.controls[2]
+    result = msal_client.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+    if not result or "access_token" not in result:
+        details = result.get("error_description") if isinstance(result, dict) else "トークン取得に失敗しました。"
+        raise RuntimeError(details)
+    return result["access_token"]
 
-    def resize_page(event):
-        viewport_width = page.width or 748
-        page.padding = 12 if viewport_width < 520 else 24
-        content_width = min(700, max(272, viewport_width - page.padding * 2))
-        app_container.width = content_width
-        content.width = content_width
-        workspace_card.width = content_width
-        page.update()
 
-    page.on_resize = resize_page
-    page.add(app_container)
-    render()
+def require_session(authorization: str | None = Header(default=None, alias="Authorization")) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="ログインしてください")
+    token = authorization.replace("Bearer ", "").strip()
+    if token not in app.state.sessions:
+        raise HTTPException(status_code=401, detail="有効なセッションがありません")
+    return token
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok", "service": "teams-data-viewer"}
+
+
+@app.post("/api/login")
+def login(payload: dict[str, str]) -> dict[str, str]:
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    if username == "admin" and password == "admin123":
+        token = uuid.uuid4().hex
+        app.state.sessions[token] = {"username": username}
+        return {"token": token, "username": username}
+    raise HTTPException(status_code=401, detail="ユーザー名またはパスワードが違います")
+
+
+@app.get("/", response_class=HTMLResponse)
+def root() -> str:
+    return """
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Teams Data Viewer</title>
+        <style>
+            :root {
+                --bg: #f4f6fb;
+                --card: #ffffff;
+                --line: #dae1f0;
+                --primary: #2b6ef5;
+                --text: #1f2937;
+                --muted: #6b7280;
+                --success: #eaf8ee;
+                --success-text: #166534;
+            }
+            * { box-sizing: border-box; }
+            body {
+                margin: 0; font-family: "Segoe UI", sans-serif; background: var(--bg); color: var(--text);
+            }
+            .container {
+                max-width: 1120px; margin: 48px auto; padding: 0 20px;
+            }
+            .login-box, .dashboard {
+                background: var(--card); border: 1px solid var(--line); border-radius: 18px; box-shadow: 0 12px 34px rgba(15, 23, 42, 0.08);
+            }
+            .login-box {
+                max-width: 420px; margin: 0 auto; padding: 32px 28px;
+            }
+            .dashboard { display: none; padding: 24px; }
+            .dashboard.visible { display: block; }
+            h1 { margin-top: 0; font-size: 2rem; }
+            .subtitle { color: var(--muted); margin-bottom: 20px; }
+            label { display: block; margin: 16px 0 8px; font-weight: 600; }
+            input, textarea, button {
+                width: 100%; border-radius: 10px; border: 1px solid var(--line); padding: 12px 14px; font-size: 1rem;
+            }
+            input, textarea { background: #f9fafb; }
+            button {
+                margin-top: 18px; background: var(--primary); color: white; border: none; cursor: pointer; font-weight: 600;
+            }
+            .demo-note { margin-top: 12px; font-size: 0.86rem; color: var(--muted); }
+            .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+            .topbar .meta { color: var(--muted); }
+            .layout { display: grid; grid-template-columns: minmax(260px, 1.1fr) minmax(320px, 1.8fr); gap: 20px; }
+            table { width: 100%; border-collapse: collapse; background: #fff; }
+            th, td { padding: 12px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+            tbody tr { cursor: pointer; }
+            tbody tr:hover { background: #f7faff; }
+            tbody tr.selected { background: #eef4ff; }
+            .channel-list { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+            .channel-item { background: #eef4ff; color: #1a4ebd; border-radius: 999px; padding: 8px 12px; cursor: pointer; }
+            .channel-item.active { background: var(--primary); color: white; }
+            .messages { margin-top: 18px; border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-height: 160px; }
+            .message { padding: 12px 0; border-bottom: 1px solid var(--line); }
+            .message:last-child { border-bottom: none; }
+            .message-head { font-size: 0.82rem; color: var(--muted); margin-bottom: 5px; }
+            .empty { color: var(--muted); padding: 18px 0; }
+            .success { background: var(--success); color: var(--success-text); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; display: none; }
+            .success.show { display: block; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div id="loginBox" class="login-box">
+                <h1>Teams Data Viewer</h1>
+                <div class="subtitle">学校の Microsoft 365 環境向けに Teams データを確認するためのログイン画面です。</div>
+                <form id="loginForm">
+                    <label for="username">ユーザー名</label>
+                    <input id="username" name="username" value="admin" required />
+                    <label for="password">パスワード</label>
+                    <input id="password" name="password" type="password" value="admin123" required />
+                    <button type="submit">ログイン</button>
+                </form>
+                <div class="demo-note">デモ用: admin / admin123</div>
+            </div>
+
+            <div id="dashboard" class="dashboard">
+                <div class="topbar">
+                    <div>
+                        <h1>Teams ダッシュボード</h1>
+                        <div class="meta">ログイン中: <span id="currentUser"></span></div>
+                    </div>
+                    <button id="logoutButton" type="button" style="width:auto; background:#475569;">ログアウト</button>
+                </div>
+
+                <div id="messageBox" class="success"></div>
+
+                <div class="layout">
+                    <div>
+                        <h2>チーム一覧</h2>
+                        <table>
+                            <thead>
+                                <tr><th>チーム名</th><th>説明</th><th>チャネル数</th></tr>
+                            </thead>
+                            <tbody id="teamTableBody"></tbody>
+                        </table>
+                    </div>
+
+                    <div>
+                        <h2>チャネル</h2>
+                        <div id="channelList" class="channel-list"></div>
+
+                        <h2 style="margin-top: 24px;">メッセージ一覧</h2>
+                        <div id="messages" class="messages"></div>
+
+                        <form id="messageForm" style="margin-top: 18px;">
+                            <label for="newMessage">新規投稿</label>
+                            <textarea id="newMessage" rows="4" placeholder="投稿内容を入力"></textarea>
+                            <button type="submit">投稿を追加</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            const state = {
+                token: localStorage.getItem('teamsToken') || '',
+                teams: [],
+                selectedTeamId: null,
+                selectedChannelId: null,
+                user: localStorage.getItem('teamsUser') || ''
+            };
+
+            const loginBox = document.getElementById('loginBox');
+            const dashboard = document.getElementById('dashboard');
+            const teamTableBody = document.getElementById('teamTableBody');
+            const channelList = document.getElementById('channelList');
+            const messagesBox = document.getElementById('messages');
+            const currentUser = document.getElementById('currentUser');
+            const messageBox = document.getElementById('messageBox');
+
+            function showMessage(text) {
+                messageBox.textContent = text;
+                messageBox.classList.add('show');
+                setTimeout(() => messageBox.classList.remove('show'), 2500);
+            }
+
+            function setAuthUI() {
+                const loggedIn = !!state.token;
+                loginBox.style.display = loggedIn ? 'none' : 'block';
+                dashboard.classList.toggle('visible', loggedIn);
+                currentUser.textContent = state.user || '未ログイン';
+            }
+
+            async function authFetch(url, options = {}) {
+                const headers = { ...(options.headers || {}) };
+                if (state.token) {
+                    headers['Authorization'] = `Bearer ${state.token}`;
+                }
+                return fetch(url, { ...options, headers });
+            }
+
+            async function loadTeams() {
+                const response = await authFetch('/api/teams');
+                if (!response.ok) {
+                    throw new Error('チーム一覧の取得に失敗しました');
+                }
+                const data = await response.json();
+                state.teams = data.teams || [];
+                if (!state.teams.length) {
+                    teamTableBody.innerHTML = '<tr><td colspan="3">チームがありません</td></tr>';
+                    return;
+                }
+                if (!state.selectedTeamId) {
+                    state.selectedTeamId = state.teams[0].id;
+                }
+                teamTableBody.innerHTML = state.teams.map(team => {
+                    const selected = team.id === state.selectedTeamId ? 'selected' : '';
+                    return `<tr data-team-id="${team.id}" class="${selected}">
+                        <td>${team.name}</td>
+                        <td>${team.description || ''}</td>
+                        <td>${(team.channels || []).length}</td>
+                    </tr>`;
+                }).join('');
+
+                teamTableBody.querySelectorAll('tr[data-team-id]').forEach(row => {
+                    row.addEventListener('click', () => {
+                        state.selectedTeamId = row.dataset.teamId;
+                        loadTeams();
+                        loadChannels();
+                    });
+                });
+
+                await loadChannels();
+            }
+
+            async function loadChannels() {
+                if (!state.selectedTeamId) return;
+                const team = state.teams.find(item => item.id === state.selectedTeamId);
+                if (!team) return;
+                const channels = team.channels || [];
+                if (!channels.length) {
+                    channelList.innerHTML = '<span class="empty">チャネルがありません</span>';
+                    messagesBox.innerHTML = '<div class="empty">メッセージはまだありません</div>';
+                    return;
+                }
+                if (!state.selectedChannelId || !channels.some(ch => ch.id === state.selectedChannelId)) {
+                    state.selectedChannelId = channels[0].id;
+                }
+                channelList.innerHTML = channels.map(channel => `
+                    <button type="button" class="channel-item ${channel.id === state.selectedChannelId ? 'active' : ''}" data-channel-id="${channel.id}">${channel.name}</button>
+                `).join('');
+                channelList.querySelectorAll('.channel-item').forEach(button => {
+                    button.addEventListener('click', () => {
+                        state.selectedChannelId = button.dataset.channelId;
+                        loadChannels();
+                    });
+                });
+                await loadMessages();
+            }
+
+            async function loadMessages() {
+                if (!state.selectedTeamId || !state.selectedChannelId) return;
+                const response = await authFetch(`/api/teams/${state.selectedTeamId}/channels/${state.selectedChannelId}/messages`);
+                if (!response.ok) {
+                    messagesBox.innerHTML = '<div class="empty">メッセージを取得できませんでした。</div>';
+                    return;
+                }
+                const data = await response.json();
+                const messages = data.messages || [];
+                if (!messages.length) {
+                    messagesBox.innerHTML = '<div class="empty">メッセージはまだありません。</div>';
+                    return;
+                }
+                messagesBox.innerHTML = messages.map(msg => `
+                    <div class="message">
+                        <div class="message-head">${msg.author}・${new Date(msg.timestamp).toLocaleString('ja-JP')}</div>
+                        <div>${(msg.content || '').replace(/\n/g, '<br>')}</div>
+                    </div>
+                `).join('');
+            }
+
+            document.getElementById('loginForm').addEventListener('submit', async (event) => {
+                event.preventDefault();
+                const payload = {
+                    username: document.getElementById('username').value,
+                    password: document.getElementById('password').value
+                };
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    alert(data.detail || 'ログインに失敗しました');
+                    return;
+                }
+                state.token = data.token;
+                state.user = data.username;
+                localStorage.setItem('teamsToken', state.token);
+                localStorage.setItem('teamsUser', state.user);
+                setAuthUI();
+                await loadTeams();
+            });
+
+            document.getElementById('logoutButton').addEventListener('click', () => {
+                state.token = '';
+                state.user = '';
+                localStorage.removeItem('teamsToken');
+                localStorage.removeItem('teamsUser');
+                setAuthUI();
+            });
+
+            document.getElementById('messageForm').addEventListener('submit', async (event) => {
+                event.preventDefault();
+                const content = document.getElementById('newMessage').value.trim();
+                if (!content || !state.selectedTeamId || !state.selectedChannelId) return;
+                const response = await authFetch(`/api/teams/${state.selectedTeamId}/channels/${state.selectedChannelId}/messages`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ author: state.user, content })
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    alert(data.detail || '投稿に失敗しました');
+                    return;
+                }
+                document.getElementById('newMessage').value = '';
+                showMessage('投稿を追加しました');
+                await loadMessages();
+            });
+
+            if (state.token) {
+                setAuthUI();
+                loadTeams().catch(() => {
+                    alert('チーム一覧の取得に失敗しました');
+                });
+            } else {
+                setAuthUI();
+            }
+        </script>
+    </body>
+    </html>
+    """
+
+
+@app.get("/api/teams")
+def get_joined_teams(authorization: str | None = Header(default=None, alias="Authorization")) -> dict[str, Any]:
+    require_session(authorization)
+    teams = []
+    for team_id, team in app.state.teams.items():
+        teams.append(
+            {
+                "id": team_id,
+                "name": team["name"],
+                "description": team["description"],
+                "channels": [
+                    {"id": channel["id"], "name": channel["name"]} for channel in team["channels"]
+                ],
+            }
+        )
+    return {"teams": teams}
+
+
+@app.get("/api/teams/{team_id}/channels")
+def get_team_channels(team_id: str, authorization: str | None = Header(default=None, alias="Authorization")) -> dict[str, Any]:
+    require_session(authorization)
+    team = app.state.teams.get(team_id)
+    if team is None:
+        raise HTTPException(status_code=404, detail="チームが見つかりません")
+    return {
+        "teamId": team_id,
+        "teamName": team["name"],
+        "channels": [{"id": channel["id"], "name": channel["name"]} for channel in team["channels"]],
+    }
+
+
+@app.get("/api/teams/{team_id}/channels/{channel_id}/messages")
+def get_channel_messages(
+    team_id: str,
+    channel_id: str,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, Any]:
+    require_session(authorization)
+    team = app.state.teams.get(team_id)
+    if team is None:
+        raise HTTPException(status_code=404, detail="チームが見つかりません")
+    for channel in team["channels"]:
+        if channel["id"] == channel_id:
+            return {"teamId": team_id, "channelId": channel_id, "messages": channel["messages"]}
+    raise HTTPException(status_code=404, detail="チャネルが見つかりません")
+
+
+@app.post("/api/teams/{team_id}/channels/{channel_id}/messages")
+def create_channel_message(
+    team_id: str,
+    channel_id: str,
+    payload: dict[str, str],
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, Any]:
+    require_session(authorization)
+    team = app.state.teams.get(team_id)
+    if team is None:
+        raise HTTPException(status_code=404, detail="チームが見つかりません")
+    for channel in team["channels"]:
+        if channel["id"] == channel_id:
+            content = (payload.get("content") or "").strip()
+            author = (payload.get("author") or "unknown").strip() or "unknown"
+            if not content:
+                raise HTTPException(status_code=400, detail="メッセージ内容が空です")
+            message = {
+                "id": f"msg-{uuid.uuid4().hex[:8]}",
+                "author": author,
+                "content": content,
+                "timestamp": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            }
+            channel["messages"].append(message)
+            return {"message": message}
+    raise HTTPException(status_code=404, detail="チャネルが見つかりません")
+
+
+@app.get("/api/graph-status")
+def graph_status() -> dict[str, Any]:
+    try:
+        get_graph_access_token()
+        return {"status": "configured", "message": "Microsoft Graph の認証設定が有効です"}
+    except RuntimeError:
+        return {"status": "demo-mode", "message": "環境変数が未設定のため、デモデータを使用しています"}
 
 
 if __name__ == "__main__":
-    ft.run(main, view=ft.AppView.WEB_BROWSER)
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
