@@ -80,6 +80,38 @@ def _make_demo_data() -> dict[str, dict[str, Any]]:
                 },
             ],
         },
+        "team-grade-1": {
+            "id": "team-grade-1",
+            "name": "1学年",
+            "description": "1学年の連絡・共有",
+            "channels": [
+                {"id": "channel-grade-1", "name": "学年連絡", "messages": []},
+            ],
+        },
+        "team-grade-2": {
+            "id": "team-grade-2",
+            "name": "2学年",
+            "description": "2学年の連絡・共有",
+            "channels": [
+                {"id": "channel-grade-2", "name": "学年連絡", "messages": []},
+            ],
+        },
+        "team-grade-3": {
+            "id": "team-grade-3",
+            "name": "3学年",
+            "description": "3学年の連絡・共有",
+            "channels": [
+                {"id": "channel-grade-3", "name": "学年連絡", "messages": []},
+            ],
+        },
+        "team-clubs": {
+            "id": "team-clubs",
+            "name": "部活動",
+            "description": "部活動に関する連絡・共有",
+            "channels": [
+                {"id": "channel-clubs", "name": "部活動連絡", "messages": []},
+            ],
+        },
     }
 
 

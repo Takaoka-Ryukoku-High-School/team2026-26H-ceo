@@ -95,7 +95,8 @@ def test_login_and_teams_flow():
     assert teams_response.status_code == 200
     payload = teams_response.json()
     assert "teams" in payload
-    assert len(payload["teams"]) >= 1
+    team_names = {team["name"] for team in payload["teams"]}
+    assert {"学校運営", "進路サポート", "1学年", "2学年", "3学年", "部活動"} <= team_names
 
     team_id = payload["teams"][0]["id"]
     channel_response = client.get(
