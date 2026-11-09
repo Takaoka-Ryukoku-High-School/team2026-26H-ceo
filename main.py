@@ -117,6 +117,17 @@ def _make_demo_data() -> dict[str, dict[str, Any]]:
 
 app.state.sessions: dict[str, dict[str, str]] = {}
 app.state.teams = _make_demo_data()
+TIMETABLE_DAYS = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日"]
+PERIOD_LABELS = ["1限", "2限", "3限", "4限", "5限", "6限"]
+app.state.timetable = {
+    "days": {
+        "月曜日": ["国語", "数学", "英語", "理科", "社会", "体育"],
+        "火曜日": ["数学", "英語", "国語", "体育", "理科", "美術"],
+        "水曜日": ["英語", "理科", "数学", "社会", "国語", "音楽"],
+        "木曜日": ["社会", "国語", "体育", "数学", "英語", "技術"],
+        "金曜日": ["理科", "数学", "英語", "国語", "家庭科", "総合"],
+    }
+}
 
 
 def get_m365_config() -> dict[str, str]:
@@ -435,6 +446,20 @@ def root() -> str:
             .compose-panel { padding-left: 20px; border-left: 1px solid var(--line); }
             .compose-panel h2 { margin-bottom: 8px; }
             .compose-hint { margin-bottom: 14px; color: var(--muted); font-size: .85rem; line-height: 1.6; }
+            .timetable-panel { margin-bottom: 22px; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
+            .timetable-heading { margin-bottom: 12px; }
+            .timetable-edit-button, .schedule-action {
+                width: auto; padding: 7px 10px; background: transparent; color: var(--primary); font-size: .82rem;
+            }
+            .timetable-day { margin-bottom: 12px; }
+            .period-list { display: grid; gap: 7px; }
+            .period-row { display: grid; grid-template-columns: 42px minmax(0, 1fr); align-items: center; gap: 8px; }
+            .period-label { color: var(--muted); font-size: .8rem; font-weight: 700; }
+            .period-subject { width: 100%; padding: 8px 9px; font-size: .86rem; }
+            .period-subject:disabled { border-color: transparent; background: #f3f6f2; color: var(--text); opacity: 1; }
+            .schedule-actions { display: flex; gap: 8px; margin-top: 12px; }
+            .schedule-actions[hidden] { display: none; }
+            .schedule-actions .schedule-save { border-color: var(--primary); background: var(--primary); color: white; }
             .compose-button, .login-button { margin-top: 14px; border: 0; background: var(--primary); color: white; }
             .compose-button:hover, .login-button:hover { background: var(--primary-dark); }
             .success { display: none; margin-bottom: 16px; padding: 10px 12px; background: var(--success); color: var(--success-text); }
@@ -511,6 +536,19 @@ def root() -> str:
                     </section>
 
                     <aside class="compose-panel">
+                        <section class="timetable-panel" aria-labelledby="timetableHeading">
+                            <div class="section-heading timetable-heading">
+                                <h2 id="timetableHeading">授業の時間割</h2>
+                                <button id="scheduleEditButton" class="timetable-edit-button" type="button">編集</button>
+                            </div>
+                            <label for="scheduleDay">曜日</label>
+                            <select id="scheduleDay" class="timetable-day"></select>
+                            <div id="periodList" class="period-list"></div>
+                            <div id="scheduleActions" class="schedule-actions" hidden>
+                                <button id="scheduleSaveButton" class="schedule-action schedule-save" type="button">変更を保存</button>
+                                <button id="scheduleCancelButton" class="schedule-action" type="button">キャンセル</button>
+                            </div>
+                        </section>
                         <p class="eyebrow">QUICK POST</p>
                         <h2>チャネルに投稿</h2>
                         <p class="compose-hint">投稿先を選んでチームに連絡します。</p>
@@ -538,6 +576,9 @@ def root() -> str:
                 selectedTeamId: '',
                 selectedChannelId: '',
                 selectedTeamFilter: '',
+                timetable: null,
+                selectedScheduleDay: '月曜日',
+                editingSchedule: false,
                 user: localStorage.getItem('teamsUser') || ''
             };
 
@@ -550,6 +591,9 @@ def root() -> str:
             const messageBox = document.getElementById('messageBox');
             const teamSelect = document.getElementById('teamSelect');
             const channelSelect = document.getElementById('channelSelect');
+            const scheduleDay = document.getElementById('scheduleDay');
+            const periodList = document.getElementById('periodList');
+            const scheduleActions = document.getElementById('scheduleActions');
 
             function showMessage(text) {
                 messageBox.textContent = text;
@@ -666,6 +710,42 @@ def root() -> str:
                 renderChannels();
                 renderTeams();
                 renderFeed();
+                await loadTimetable();
+            }
+
+            async function loadTimetable() {
+                const response = await authFetch('/api/timetable');
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.detail || '時間割の読み込みに失敗しました');
+                }
+                state.timetable = data;
+                state.editingSchedule = false;
+                renderTimetable();
+            }
+
+            function renderTimetable() {
+                if (!state.timetable) return;
+                const days = Object.keys(state.timetable.days);
+                if (!days.includes(state.selectedScheduleDay)) {
+                    state.selectedScheduleDay = days[0] || '';
+                }
+                scheduleDay.innerHTML = days.map(day =>
+                    `<option value="${escapeHtml(day)}">${escapeHtml(day)}</option>`
+                ).join('');
+                scheduleDay.value = state.selectedScheduleDay;
+                scheduleDay.disabled = state.editingSchedule;
+                const subjects = state.timetable.days[state.selectedScheduleDay] || [];
+                periodList.innerHTML = subjects.map((subject, index) => `
+                    <label class="period-row">
+                        <span class="period-label">${index + 1}限</span>
+                        <input class="period-subject" type="text" maxlength="40"
+                            aria-label="${index + 1}限の授業"
+                            value="${escapeHtml(subject)}" ${state.editingSchedule ? '' : 'disabled'} />
+                    </label>
+                `).join('');
+                document.getElementById('scheduleEditButton').hidden = state.editingSchedule;
+                scheduleActions.hidden = !state.editingSchedule;
             }
 
             async function loadFeed() {
@@ -724,6 +804,39 @@ def root() -> str:
 
             channelSelect.addEventListener('change', () => {
                 state.selectedChannelId = channelSelect.value;
+            });
+
+            scheduleDay.addEventListener('change', () => {
+                state.selectedScheduleDay = scheduleDay.value;
+                renderTimetable();
+            });
+
+            document.getElementById('scheduleEditButton').addEventListener('click', () => {
+                state.editingSchedule = true;
+                renderTimetable();
+            });
+
+            document.getElementById('scheduleCancelButton').addEventListener('click', () => {
+                loadTimetable().catch(error => showMessage(error.message || '時間割を読み込めませんでした'));
+            });
+
+            document.getElementById('scheduleSaveButton').addEventListener('click', async () => {
+                const subjects = [...periodList.querySelectorAll('.period-subject')].map(input => input.value.trim());
+                const days = { ...state.timetable.days, [state.selectedScheduleDay]: subjects };
+                const response = await authFetch('/api/timetable', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ days })
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    showMessage(data.detail || '時間割を保存できませんでした');
+                    return;
+                }
+                state.timetable = data;
+                state.editingSchedule = false;
+                renderTimetable();
+                showMessage('時間割を変更しました');
             });
 
             document.getElementById('refreshButton').addEventListener('click', () => {
@@ -787,6 +900,35 @@ def get_all_messages(authorization: str | None = Header(default=None, alias="Aut
     require_session(authorization)
     snapshot = get_dashboard_snapshot()
     return {"messages": snapshot["messages"], "source": snapshot["source"]}
+
+
+@app.get("/api/timetable")
+def get_timetable(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, Any]:
+    require_session(authorization)
+    return app.state.timetable
+
+
+@app.put("/api/timetable")
+def update_timetable(
+    payload: dict[str, Any],
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, Any]:
+    require_session(authorization)
+    days = payload.get("days")
+    if not isinstance(days, dict) or set(days) != set(TIMETABLE_DAYS):
+        raise HTTPException(status_code=400, detail="月曜日から金曜日までの時間割を指定してください")
+    for day in TIMETABLE_DAYS:
+        subjects = days[day]
+        if (
+            not isinstance(subjects, list)
+            or len(subjects) != len(PERIOD_LABELS)
+            or any(not isinstance(subject, str) or len(subject) > 40 for subject in subjects)
+        ):
+            raise HTTPException(status_code=400, detail=f"{day}は6限分の授業名（40文字以内）を指定してください")
+    app.state.timetable = {"days": {day: list(days[day]) for day in TIMETABLE_DAYS}}
+    return app.state.timetable
 
 
 @app.get("/api/teams/{team_id}/channels")

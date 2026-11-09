@@ -86,6 +86,31 @@ def test_all_messages_requires_auth_and_returns_team_channel_context():
     assert timestamps == sorted(timestamps, reverse=True)
 
 
+def test_timetable_requires_auth_and_can_be_updated():
+    assert client.get("/api/timetable").status_code == 401
+    login_response = client.post("/api/login", json={"username": "admin", "password": "admin123"})
+    token = login_response.json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    original = main.app.state.timetable
+    updated = {
+        "days": {
+            day: [f"{day}{period}" for period in range(1, 7)]
+            for day in main.TIMETABLE_DAYS
+        }
+    }
+
+    try:
+        response = client.put("/api/timetable", headers=headers, json=updated)
+        assert response.status_code == 200
+        assert response.json() == updated
+        assert client.get("/api/timetable", headers=headers).json() == updated
+
+        invalid = {"days": {**updated["days"], "月曜日": ["国語"]}}
+        assert client.put("/api/timetable", headers=headers, json=invalid).status_code == 400
+    finally:
+        main.app.state.timetable = original
+
+
 def test_login_and_teams_flow():
     login_response = client.post("/api/login", json={"username": "admin", "password": "admin123"})
     assert login_response.status_code == 200
